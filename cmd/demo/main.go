@@ -28,6 +28,19 @@ func main() {
 	}
 	defer b.Close()
 
+	// 打印本次启动的崩溃自愈结果（正常情况下全部无修复）。
+	for _, r := range b.RecoveryReports() {
+		if r.Repaired || r.NeedsAttention {
+			log.Printf("[demo] recovery partition=%d repaired=%v needs_attention=%v valid=%d->%d bytes=%d->%d truncated=%d reason=%s",
+				r.Partition, r.Repaired, r.NeedsAttention,
+				r.ValidMessagesBefore, r.ValidMessagesAfter,
+				r.BytesBefore, r.BytesAfter, r.TruncatedBytes, r.Reason)
+		}
+	}
+	if attn := b.PartitionsNeedingAttention(); len(attn) > 0 {
+		log.Printf("[demo] WARNING: partitions %v need manual intervention", attn)
+	}
+
 	s, err := pipeline.OpenStateStore(dir + "/consumer-state.json")
 	if err != nil {
 		log.Fatalf("open state: %v", err)

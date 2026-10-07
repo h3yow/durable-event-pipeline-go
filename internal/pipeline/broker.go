@@ -13,9 +13,12 @@ import (
 type Broker struct {
 	dir        string
 	partitions []*partitionLog
+	recovery   []PartitionRecovery // 打开时各分区的崩溃自愈结果
 }
 
 // OpenBroker 打开 dir 下的 broker，分区数为 n；已有日志文件会被续用。
+// 打开过程中对每个分区执行崩溃自愈（见 openPartitionLog），
+// 结果可通过 RecoveryReports 查询。
 func OpenBroker(dir string, n int) (*Broker, error) {
 	if n <= 0 {
 		return nil, fmt.Errorf("partition count must be positive, got %d", n)
@@ -25,7 +28,7 @@ func OpenBroker(dir string, n int) (*Broker, error) {
 	}
 	b := &Broker{dir: dir}
 	for i := 0; i < n; i++ {
-		l, err := openPartitionLog(filepath.Join(dir, fmt.Sprintf("partition-%d.log", i)))
+		l, rep, err := openPartitionLog(filepath.Join(dir, fmt.Sprintf("partition-%d.log", i)), i)
 		if err != nil {
 			for _, pl := range b.partitions {
 				pl.Close()
@@ -33,12 +36,32 @@ func OpenBroker(dir string, n int) (*Broker, error) {
 			return nil, err
 		}
 		b.partitions = append(b.partitions, l)
+		b.recovery = append(b.recovery, *rep)
 	}
 	return b, nil
 }
 
 // NumPartitions 返回分区数。
 func (b *Broker) NumPartitions() int { return len(b.partitions) }
+
+// RecoveryReports 返回本次打开时各分区的崩溃自愈报告快照，
+// 可据此识别发生过修复的分区、修复前后的数据规模与需人工介入的分区。
+func (b *Broker) RecoveryReports() []PartitionRecovery {
+	out := make([]PartitionRecovery, len(b.recovery))
+	copy(out, b.recovery)
+	return out
+}
+
+// PartitionsNeedingAttention 返回存在中部损坏、需人工介入的分区号列表。
+func (b *Broker) PartitionsNeedingAttention() []int {
+	var out []int
+	for _, r := range b.recovery {
+		if r.NeedsAttention {
+			out = append(out, r.Partition)
+		}
+	}
+	return out
+}
 
 // partitionFor 按 key 的 FNV 哈希确定分区；空 key 随机分配。
 func (b *Broker) partitionFor(key string) int {

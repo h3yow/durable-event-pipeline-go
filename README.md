@@ -9,6 +9,7 @@
 internal/pipeline/
   message.go   消息信封与版本兼容规则
   log.go       单分区追加式日志（JSON Lines，offset 即行号）
+  recover.go   崩溃自愈：扫描校验日志、截断残缺尾部、生成恢复报告
   broker.go    多分区代理，按 key 哈希分区，落盘即 fsync
   state.go     消费位点 / 幂等记录 / 重试计数 / 死信的持久化（tmp+rename 原子写）
   retry.go     指数退避策略与可区分失败类型
@@ -57,11 +58,40 @@ cmd/demo/      可本地运行的演示程序
   兼容记录；每次变更先写 `.tmp` 再 rename 并 fsync 目录，崩溃不会留下半截状态。
 - 重启后从已提交位点继续，未确认消息重新投递，位点不会重复推进。
 
+## 崩溃自愈（写一半被强杀 / 断电）
+
+消息逐条 `append + fsync`，但进程仍可能在“写了一半”时被强杀，在分区日志
+末尾留下残缺数据。`OpenBroker` 打开每个分区时会先做一次自愈扫描：
+
+- **判定规则**：一行只有同时满足“以 `\n` 结尾、非空、是合法 JSON 信封、
+  信封内 offset 与行号一致”才被视为完整消息；最后一行没有换行结尾即视为
+  写到一半的残缺数据。
+- **尾部残缺**：截断到最后一条完整消息之后。截断点只由文件内容决定，
+  因此同一份损坏现场无论重启多少次恢复结果都一致；对已恢复的现场再次
+  扫描不会再触发任何修改（幂等，不会伤及后面的好数据）。
+- **中部损坏**（损坏点之后仍存在完整消息）：不做任何自动修改——截断会
+  丢失后面的好数据（其中可能包含已确认消息）。该分区被标记为
+  `NeedsAttention`，拒绝新写入（`ErrPartitionNeedsAttention`），消费推进
+  到损坏点前停住，等待人工介入；其余分区不受影响。
+- **对既有语义的影响**：自愈只丢弃从未完整落盘、也从未被消费确认过的
+  残缺字节，已确认消息与已提交位点不丢、不倒退；恢复后新消息 offset
+  从截断点连续分配，分区内有序、跨分区并发、重试/死信语义全部保持。
+- **可观测**：`Broker.RecoveryReports()` 返回分区级报告（是否修复、
+  修复前后完整消息数与字节数、截断字节数、原因）；`Broker.PartitionsNeedingAttention()`
+  列出需人工介入的分区。
+- **兼容性边界**：自愈针对的是“上一版本写入格式相同”的日志文件；
+  扫描为单遍流式读取，耗时随分区数据量线性增长（几十万条量级无退化）。
+
 ## 本地运行与验证
 
 ```bash
 # 运行演示（重复执行可观察位点恢复，状态在 ./demo-data）
 go run ./cmd/demo
+
+# 复现崩溃自愈：先运行一次 demo，再向分区日志追加半行残缺字节，然后再运行
+go run ./cmd/demo
+printf '{"id":"torn","part' >> demo-data/partition-0.log   # 模拟写一半被强杀
+go run ./cmd/demo   # 日志中可见 recovery 报告，分区照常恢复消费
 
 # 运行全部测试（日志含分区标识、位点与失败原因）
 go test -v ./internal/pipeline/
@@ -73,4 +103,8 @@ go test -race -count=5 ./...
 测试覆盖：分区内顺序（`TestPartitionOrder`）、跨分区并发（`TestCrossPartitionConcurrency`）、
 重试后成功（`TestRetryThenSuccess`）、重试上限与不可重试死信（`TestNonRetryableToDeadLetter`）、
 重启恢复（`TestRestartRecovery`）、版本兼容（`TestVersionCompat`）、
-重复投递幂等（`TestDuplicateDeliveryNoDuplicateEffect`）。
+重复投递幂等（`TestDuplicateDeliveryNoDuplicateEffect`）、
+尾部残缺恢复（`TestTornTailRecovery`）、恢复幂等与确定性（`TestRecoveryIdempotent`）、
+恢复不丢已确认进度（`TestRecoveryPreservesCommittedProgress`）、
+中部损坏人工介入（`TestMidLogCorruptionNeedsAttention`）、
+恢复耗时线性增长（`TestRecoveryScalesLinearly`）。
