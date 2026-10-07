@@ -28,6 +28,23 @@ func main() {
 	}
 	defer b.Close()
 
+	// 打印本次启动各分区的崩溃自愈结果（含修复前后规模 / 人工介入标记）。
+	for _, r := range b.RecoveryStatus() {
+		switch {
+		case r.NeedsIntervention:
+			log.Printf("[demo] partition=%d RECOVERY needs-intervention reason=%s damaged_offset=%d valid_records=%d detail=%q",
+				r.Partition, r.Reason, r.DamagedOffset, r.AfterRecords, r.Detail)
+		case r.Repaired:
+			log.Printf("[demo] partition=%d RECOVERY repaired reason=%s records %d->%d removed=%d truncated_bytes=%d quarantine=%s",
+				r.Partition, r.Reason, r.BeforeRecords, r.AfterRecords, r.RemovedRecords, r.TruncatedBytes, r.QuarantineFile)
+		default:
+			log.Printf("[demo] partition=%d recovery healthy records=%d", r.Partition, r.AfterRecords)
+		}
+	}
+	if events, err := b.RecoveryEvents(); err == nil && len(events) > 0 {
+		log.Printf("[demo] recovery events on record: %d (see %s/recovery.json)", len(events), dir)
+	}
+
 	s, err := pipeline.OpenStateStore(dir + "/consumer-state.json")
 	if err != nil {
 		log.Fatalf("open state: %v", err)
@@ -62,10 +79,13 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	c.Start(ctx)
 
-	// 等待所有分区追平日志末尾后退出。
+	// 等待所有可推进分区追平日志末尾后退出；被标记人工介入的分区不参与等待。
 	for {
 		done := true
 		for p := 0; p < b.NumPartitions(); p++ {
+			if b.NeedsIntervention(p) {
+				continue
+			}
 			if s.CommittedOffset(p) < b.PartitionLength(p) {
 				done = false
 			}
@@ -79,7 +99,11 @@ func main() {
 	c.Wait()
 
 	for p := 0; p < b.NumPartitions(); p++ {
-		log.Printf("[demo] partition=%d committed=%d length=%d", p, s.CommittedOffset(p), b.PartitionLength(p))
+		flag := ""
+		if b.NeedsIntervention(p) {
+			flag = " HALTED(needs manual intervention)"
+		}
+		log.Printf("[demo] partition=%d committed=%d length=%d%s", p, s.CommittedOffset(p), b.PartitionLength(p), flag)
 	}
 	if dead := s.DeadLetters(); len(dead) > 0 {
 		for _, d := range dead {

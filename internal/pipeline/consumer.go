@@ -62,6 +62,17 @@ func (c *Consumer) consumePartition(ctx context.Context, partition int) {
 		if ctx.Err() != nil {
 			return
 		}
+		// 分区日志出现无法自动修复的损坏：停摆等待人工介入，
+		// 只安静等待 ctx，不反复刷错误日志；其他分区循环不受影响。
+		if c.broker.NeedsIntervention(partition) {
+			c.logger.Printf("[consumer] partition=%d halted: log needs manual intervention (see broker recovery status)", partition)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+			continue
+		}
 		offset := c.state.CommittedOffset(partition)
 		m, err := c.broker.Read(partition, offset)
 		if errors.Is(err, ErrOffsetBeyondEnd) {
@@ -73,6 +84,15 @@ func (c *Consumer) consumePartition(ctx context.Context, partition int) {
 			}
 		}
 		if err != nil {
+			if errors.Is(err, ErrPartitionNeedsIntervention) {
+				c.logger.Printf("[consumer] partition=%d halted: %v", partition, err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
+				continue
+			}
 			c.logger.Printf("[consumer] partition=%d offset=%d read error: %v", partition, offset, err)
 			select {
 			case <-ctx.Done():

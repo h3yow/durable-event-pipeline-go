@@ -13,6 +13,7 @@ import (
 type Broker struct {
 	dir        string
 	partitions []*partitionLog
+	rstore     *recoveryStore
 }
 
 // OpenBroker 打开 dir 下的 broker，分区数为 n；已有日志文件会被续用。
@@ -23,15 +24,21 @@ func OpenBroker(dir string, n int) (*Broker, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	b := &Broker{dir: dir}
+	b := &Broker{
+		dir:    dir,
+		rstore: newRecoveryStore(filepath.Join(dir, "recovery.json")),
+	}
 	for i := 0; i < n; i++ {
-		l, err := openPartitionLog(filepath.Join(dir, fmt.Sprintf("partition-%d.log", i)))
+		l, err := openPartitionLog(filepath.Join(dir, fmt.Sprintf("partition-%d.log", i)), i)
 		if err != nil {
 			for _, pl := range b.partitions {
 				pl.Close()
 			}
 			return nil, err
 		}
+		// 日志修复在打开时已经完成；报告持久化失败不影响已修复的分区，
+		// 内存中的状态仍可通过 RecoveryStatus 查询。
+		_ = b.rstore.record(l.recoveryStatus())
 		b.partitions = append(b.partitions, l)
 	}
 	return b, nil
@@ -103,6 +110,34 @@ func (b *Broker) Read(partition int, offset int64) (*Message, error) {
 // PartitionLength 返回分区当前长度（下一个待分配 offset）。
 func (b *Broker) PartitionLength(partition int) int64 {
 	return b.partitions[partition].NextOffset()
+}
+
+// RecoveryStatus 返回每个分区最近一次打开时的恢复结果快照。
+func (b *Broker) RecoveryStatus() []PartitionRecovery {
+	out := make([]PartitionRecovery, len(b.partitions))
+	for i, l := range b.partitions {
+		out[i] = l.recoveryStatus()
+	}
+	return out
+}
+
+// RecoveryEvents 返回历史上发生过的修复 / 需介入异常事件（跨重启持久化）。
+func (b *Broker) RecoveryEvents() ([]PartitionRecovery, error) {
+	book, err := b.rstore.load()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PartitionRecovery, len(book.Events))
+	copy(out, book.Events)
+	return out, nil
+}
+
+// NeedsIntervention 报告分区是否存在需人工介入的异常。
+func (b *Broker) NeedsIntervention(partition int) bool {
+	if partition < 0 || partition >= len(b.partitions) {
+		return false
+	}
+	return b.partitions[partition].needsIntervention()
 }
 
 func (b *Broker) Close() error {

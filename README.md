@@ -1,19 +1,21 @@
 # durable-event-pipeline-go
 
 用本地磁盘持久化模拟消息代理与消费者的事件投递组件：分区有序、并发消费、
-失败重试、死信转移、进程重启后状态可恢复。
+失败重试、死信转移、进程重启后状态可恢复，并能在“消息写一半进程被强杀/断电”
+后自动识别并修复残缺数据（崩溃自愈）。
 
 ## 结构
 
 ```
 internal/pipeline/
   message.go   消息信封与版本兼容规则
-  log.go       单分区追加式日志（JSON Lines，offset 即行号）
+  log.go       单分区追加式日志（JSON Lines，offset 即行号）+ 打开时崩溃自愈
   broker.go    多分区代理，按 key 哈希分区，落盘即 fsync
   state.go     消费位点 / 幂等记录 / 重试计数 / 死信的持久化（tmp+rename 原子写）
   retry.go     指数退避策略与可区分失败类型
+  recovery.go  分区恢复报告的持久化（recovery.json，tmp+rename 原子写）
   consumer.go  每分区一个消费循环，确认后提交位点
-cmd/demo/      可本地运行的演示程序
+cmd/demo/      可本地运行的演示程序（启动时打印各分区恢复结果）
 ```
 
 ## 投递与确认语义
@@ -57,6 +59,60 @@ cmd/demo/      可本地运行的演示程序
   兼容记录；每次变更先写 `.tmp` 再 rename 并 fsync 目录，崩溃不会留下半截状态。
 - 重启后从已提交位点继续，未确认消息重新投递，位点不会重复推进。
 
+## 崩溃自愈（半截写入现场）
+
+真实故障中进程可能在一次 `write` 落到一半时被 `SIGKILL` 或断电：分区日志
+尾部留下一段不是完整 JSON 信封的残缺字节。旧版本会把残缺行计入长度，导致该
+分区每次读取都反序列化失败、消费循环永久卡在原地。组件现在在**打开每个分区
+日志时做一次单遍扫描**并自动处置：
+
+- **尾部残缺（自动修复）**：若损坏只出现在最后一条非空记录（写一半崩溃只会
+  造成这种形态），组件：
+  1. 把残缺字节原样留存到取证文件 `partition-N.offset-M.torn`（原子 rename）；
+  2. 把日志 `truncate` 到损坏行起点之前并 fsync（含目录项）；
+  3. 该分区以修复后的长度继续接收写入与消费，前面的好数据一条不动。
+- **中部损坏（人工介入）**：若损坏行之后还存在数据（不属于半截写入，可能是
+  磁盘/人为改写），组件**绝不截断**，将该分区标记为需人工介入
+  （`NeedsIntervention`），该分区的消费循环安静停摆、新写入被拒绝，
+  其余健康分区照常推进。日志文件原样保留，等待人工检查。
+- **校验口径**：一行必须是可解析且带 `id` 的信封才算有效记录；**未知版本不
+  算损坏**，照常保留并由消费端按版本兼容规则转入死信。
+
+确定性与幂等：
+
+- 修复是纯函数式的“截断到最后一条有效记录之后”，同一份损坏现场无论重启
+  多少次，磁盘结果与恢复指标完全一致；重复打开看到的是健康日志，不会再截断
+  好数据，也不会凭空多/少消息。
+- 修复事件持久化到 `recovery.json`（每分区最新状态 + 事件流水）；同一现场
+  （分区/原因/损坏位点/截断字节数/前后规模相同）只记一条事件，重启不膨胀。
+- 修复发生在任何新写入之前；修复若在执行中再次崩溃，重启后重新单遍扫描，
+  仍然收敛到同一结果。
+
+对既有语义的影响：
+
+- **投递/确认**：已确认消息与已提交位点完全不受影响，修复只可能裁掉尾部
+  “从未成功落盘”的不完整记录，位点只进不退；修复后新消息的 offset 紧接
+  有效记录连续编号。那条没写完整的消息如同未投递成功，由生产者重发即可。
+- **分区顺序 / 跨分区并发**：修复后分区内 offset 依旧连续、消费依旧严格
+  有序；打开时各分区独立扫描，单个分区停摆不影响其他分区并发消费。
+- **兼容性边界**：自愈只针对本组件自己的 JSON Lines 分区日志格式与
+  `fsync`+`O_APPEND` 的写模型；`consumer-state.json` 与 `recovery.json`
+  仍是原子整体写，本身不存在半截写问题。手工删改这些文件不属于支持场景。
+
+可观测性（程序内查询）：
+
+- `Broker.RecoveryStatus() []PartitionRecovery`：每个分区本次打开的恢复
+  结果，含 `Healthy/Repaired/NeedsIntervention`、修复前后记录数
+  （`BeforeRecords/AfterRecords`）、移除条数、截断字节数、损坏位点与
+  取证文件路径；
+- `Broker.RecoveryEvents()`：跨重启持久化的修复/介入事件流水；
+- `Broker.NeedsIntervention(partition)`：是否存在需人工介入的异常分区。
+
+性能：打开时的扫描是 O(文件字节数) 单遍读 + 尾部 O(1) `truncate`，不会
+重读全文件，也不在消费热路径上。实测单分区 20 万条记录（约 30MB）恢复扫描
+约 0.3s（见 `TestRecoveryScalesLinearly`，规模放大 20 倍耗时按线性预算
+校验，专门用于发现 O(n²) 退化）。
+
 ## 本地运行与验证
 
 ```bash
@@ -68,9 +124,33 @@ go test -v ./internal/pipeline/
 
 # 稳定性验证：竞态检测 + 反复运行
 go test -race -count=5 ./...
+
+# 仅大规模线性恢复测试（-short 时跳过）
+go test -v -run TestRecoveryScalesLinearly ./internal/pipeline/
+```
+
+手动复现半截写入自愈：
+
+```bash
+# 1) 先跑一次 demo，落一批消息
+DEMO_DIR=/tmp/demo-rec go run ./cmd/demo
+# 2) 往某个分区日志尾部直接追加一段不完整 JSON（无闭合、无换行），模拟断电
+printf '%s' '{"id":"manual-torn","version":1,"partit' \
+  >> /tmp/demo-rec/partition-1.log
+# 3) 再次运行：启动日志会打印
+#    partition=1 RECOVERY repaired reason=torn_tail_truncated records N->N-1 ...
+#    并生成取证文件 /tmp/demo-rec/partition-1.offset-*.torn
+DEMO_DIR=/tmp/demo-rec go run ./cmd/demo
+cat /tmp/demo-rec/recovery.json   # 查看分区级恢复报告与事件流水
 ```
 
 测试覆盖：分区内顺序（`TestPartitionOrder`）、跨分区并发（`TestCrossPartitionConcurrency`）、
 重试后成功（`TestRetryThenSuccess`）、重试上限与不可重试死信（`TestNonRetryableToDeadLetter`）、
 重启恢复（`TestRestartRecovery`）、版本兼容（`TestVersionCompat`）、
-重复投递幂等（`TestDuplicateDeliveryNoDuplicateEffect`）。
+重复投递幂等（`TestDuplicateDeliveryNoDuplicateEffect`）、
+尾部半截写入自愈（`TestTornTailRecovery`）、恢复幂等与跨重启一致性
+（`TestRecoveryIdempotent`）、修复后继续消费且位点不回退
+（`TestConsumeAfterRecovery` / `TestTornTailDoesNotRegressProgress`）、
+中部损坏人工介入且健康分区不被拖垮（`TestMidFileCorruptionIntervention`）、
+恢复报告可查询（`TestRecoveryStatusVisible`）、大规模线性恢复
+（`TestRecoveryScalesLinearly`）。
